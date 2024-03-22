@@ -1,66 +1,78 @@
+import os
 import logging
-from cartesi import DApp, JSONRouter, URLRouter
 
-from routes.hello_route import register_hello
-from routes.register_deposite_route import register_deposit
-from routes.generate_claim_route import generate_claim
-from routes.withdraw_route import withdraw
-from routes.finalize_claim_route import finalize_claim
-from routes.generate_dispute_route import generate_dispute
-from routes.validate_claim_route import validate_and_finalize
-
+from .models import RollupResponse
+from .rollup import Rollup, HTTPRollupServer
+from .router import Router
 
 LOGGER = logging.getLogger(__name__)
-logging.basicConfig(level=logging.DEBUG)
-
-dapp = DApp()
-json_router = JSONRouter()
-dapp.add_router(json_router)
-url_router = URLRouter()
-dapp.add_router(url_router)
+ROLLUP_SERVER = os.environ.get('ROLLUP_HTTP_SERVER_URL')
 
 
-##################
-# Testing Routes #
-##################
+class DApp:
 
-register_hello(url_router, json_router)
+    def __init__(self):
+        self.routers: list[Router] = []
+        self.default_advance_handler = lambda rollup, data: False
+        self.default_inspect_handler = lambda rollup, data: False
+        self.rollup: Rollup | None = None
 
-#######################################
-# default register and deposite route #
-#######################################
+    def advance(self):
+        """Decorator for inserting handle advance"""
 
-register_deposit(dapp)
+        def decorator(func):
+            LOGGER.debug("Adding func %s to advance_handler", repr(func))
+            self.default_advance_handler = func
+            return func
 
-#################
-# Claim Handler #
-#################
+        LOGGER.debug('Returning an Advance Decorator')
+        return decorator
 
-generate_claim(json_router)
+    def inspect(self):
+        """Decorator for inserting handle advance"""
 
-####################
-# Withdraw Handler #
-####################
+        def decorator(func):
+            self.default_inspect_handler = func
+            return func
 
-withdraw(json_router=json_router)
+        return decorator
 
-##################
-# Finalize Claim #
-##################
+    def _get_default_handler(self, request: RollupResponse):
+        """Get the default handler"""
+        LOGGER.debug('Will handle a request of type %s', request.request_type)
+        if request.request_type == 'advance_state':
+            handler = self.default_advance_handler
+        else:
+            handler = self.default_inspect_handler
+        return handler
 
-finalize_claim(json_router=json_router)
+    def _handle(self, request: RollupResponse) -> bool:
 
-####################
-# Generate Dispute #
-####################
+        # Look for a handler among the routers:
+        handler = None
+        for router in self.routers:
+            handler = router.get_handler(request)
+            if handler is not None:
+                break
 
-generate_dispute(json_router=json_router)
+        # Get the default handler if needed
+        if handler is None:
+            handler = self._get_default_handler(request)
 
-###################
-# Handle Validate #
-###################
+        logging.debug("Handler: %s", repr(handler))
+        try:
+            status = handler(self.rollup, request.data)
+        except Exception:
+            LOGGER.error("Exception while handling request", exc_info=True)
+            status = False
 
-validate_and_finalize(json_router=json_router)
+        return status
 
-if __name__ == "__main__":
-    dapp.run()
+    def add_router(self, router: Router):
+        self.routers.append(router)
+
+    def run(self):
+        if self.rollup is None:
+            self.rollup = HTTPRollupServer()
+        self.rollup.set_handler(self._handle)
+        self.rollup.main_loop()
